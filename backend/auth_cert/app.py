@@ -11,7 +11,6 @@ app = Flask(__name__)
 CORS(app)
 
 CARBONMARK_API_KEY = os.getenv("CARBONMARK_API_KEY")
-# Keep this default for fallback, but ensure your .env is loaded correctly
 CARBONMARK_API_BASE_URL = os.getenv("CARBONMARK_API_BASE_URL", "https://api.carbonmark.com")
 
 PATTERNS = {
