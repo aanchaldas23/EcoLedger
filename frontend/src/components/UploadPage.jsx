@@ -71,7 +71,7 @@ export default function UploadPage() {
             const authFormData = new FormData();
             authFormData.append('certificate', selectedFile);
 
-            const authResponse = await fetch('http://localhost:5001/authenticate', {
+            const authResponse = await fetch('http://localhost:5001/api/authenticate', {
                 method: 'POST',
                 body: authFormData,
             });
