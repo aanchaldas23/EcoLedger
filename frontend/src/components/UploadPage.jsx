@@ -11,6 +11,8 @@ export default function UploadPage() {
     const [authProcessing, setAuthProcessing] = useState(false);
     const [uploadStatus, setUploadStatus] = useState(null);
     const navigate = useNavigate();
+    const email = localStorage.getItem('email');
+    console.log('Email from localStorage:', email);
 
     const handleFileChange = (event) => {
         const file = event.target.files[0];
@@ -43,8 +45,11 @@ export default function UploadPage() {
 
         try {
             // Step 1: Upload the certificate to Node.js backend
-            const uploadResponse = await fetch('http://localhost:5000/api/upload-certificate', {
+            const uploadResponse = await fetch('http://localhost:5000/api/credits/upload', {
                 method: 'POST',
+                headers: {
+                    email: email, // ✅ user's email from login
+                },
                 body: formData,
             });
 
@@ -71,11 +76,14 @@ export default function UploadPage() {
             const authFormData = new FormData();
             authFormData.append('certificate', selectedFile);
 
-            const authResponse = await fetch('http://localhost:5001/api/authenticate', {
+            const authResponse = await fetch('http://localhost:5001/api/credits/authenticate', {
                 method: 'POST',
+                headers: {
+                    email: email, // ✅ user's email from login
+                },
                 body: authFormData,
             });
-
+            console.log('Authentication response:', authResponse);
             const authData = await authResponse.json();
 
             navigate('/authenticate-result', {

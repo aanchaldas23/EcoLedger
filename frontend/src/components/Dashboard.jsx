@@ -1,44 +1,164 @@
-import React, { useState } from "react";
-import { FaEye, FaShareSquare } from "react-icons/fa"; // Make sure react-icons/fa is installed
-import { useNavigate } from "react-router-dom"; // Essential for navigation
+import React, { useState, useEffect } from "react";
+import { useNavigate, useLocation } from "react-router-dom";
+import { 
+  FaEye, 
+  FaShareSquare, 
+  FaSpinner,
+  FaCheckCircle,
+  FaTimesCircle,
+  FaInfoCircle,
+  FaFilePdf 
+} from "react-icons/fa";
 
 export default function Dashboard() {
   const [selectedTab, setSelectedTab] = useState("carbon");
   const [selectedToggle, setSelectedToggle] = useState("owned");
   const [aiDropdownOpen, setAiDropdownOpen] = useState(false);
-  const [selectedCreditForDetails, setSelectedCreditForDetails] = useState(null); // State for modal
+  const [selectedCreditForDetails, setSelectedCreditForDetails] = useState(null);
+  const [ownedCredits, setOwnedCredits] = useState([]);
+  const [marketCredits, setMarketCredits] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [message, setMessage] = useState("");
+  const [messageType, setMessageType] = useState("");
+  const [totalCredits, setTotalCredits] = useState(0);
+  const [pdfViewerOpen, setPdfViewerOpen] = useState(false);
+  const [currentPdfId, setCurrentPdfId] = useState(null);
 
-  // Correctly initialize the navigate function from react-router-dom
   const navigate = useNavigate();
+  const location = useLocation();
 
-  // Helper function for icons based on type
+  useEffect(() => {
+    if (!location.state?.authResult) {
+      const savedAuth = localStorage.getItem('lastAuthResult');
+      if (savedAuth) setLocationState({...location.state, authResult: JSON.parse(savedAuth)});
+    }
+    
+    const fetchData = async () => {
+      try {
+        setLoading(true);
+        const userId = localStorage.getItem('userId');
+
+        if (!userId) {
+          navigate('/');
+          return;
+        }
+
+        const ownedResponse = await fetch(`http://localhost:5000/api/marketplace/listings?user=${userId}`);
+    
+        const marketResponse = await fetch(`http://localhost:5000/api/marketplace/listings?status=available`);
+
+        if (!ownedResponse.ok || !marketResponse.ok) {
+          throw new Error(`Failed to fetch data: ${ownedResponse.status} / ${marketResponse.status}`);
+        }
+
+        const ownedData = await ownedResponse.json();
+        const marketData = await marketResponse.json();
+
+        const owned = ownedData.listings
+          .filter(item => item.owner_id === userId)
+          .map(item => ({
+            id: item.serial_number || item.project_id,
+            type: item.category || "Unknown",
+            volume: item.amount || 0,
+            status: "Active",
+            date: item.listed_date?.substring(0, 10) || item.issuance_date?.substring(0, 10),
+            description: item.listing_description || `Credits from ${item.project_name}`,
+            price: item.price_per_credit,
+            totalValue: item.total_value || (item.price_per_credit * item.amount),
+            rawData: item
+          }));
+
+        const market = marketData.listings.map(item => ({
+          id: item.serial_number || item.project_id,
+          type: item.category || "Unknown",
+          volume: item.amount || 0,
+          status: item.status || "Available",
+          date: item.listed_date?.substring(0, 10),
+          description: `Price: $${item.price_per_credit?.toFixed(2) || "N/A"} | Total: $${item.total_value?.toFixed(2) || (item.price_per_credit * item.amount)?.toFixed(2) || "N/A"}`,
+          price: item.price_per_credit,
+          totalValue: item.total_value || (item.price_per_credit * item.amount),
+          rawData: item
+        }));
+
+        setOwnedCredits(owned);
+        setMarketCredits(market);
+        setTotalCredits(owned.reduce((sum, item) => sum + item.volume, 0));
+
+      } catch (err) {
+        setError(err.message);
+        console.error("Fetch error:", err);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchData();
+  }, [location.state, navigate]);     
+ 
   const getTypeIcon = (type) => {
-    switch (type) {
-      case "Forestry": return "🌿";
-      case "Renewable Energy": return "💨";
-      case "Waste Management": return "♻️";
-      case "Industrial Efficiency": return "🏭";
+    switch ((type || "").toLowerCase()) {
+      case "forestry": return "🌿";
+      case "renewable energy": return "💨";
+      case "waste management": return "♻️";
+      case "industrial efficiency": return "🏭";
       default: return "🌱";
     }
   };
 
-  // Updated ownedCredits data to match the image and include more items/statuses
-  const ownedCredits = [
-    { id: "CRC001", type: "Forestry", volume: 1500, status: "Active", date: "2023-01-15", description: "Details for CRC001: This is a verified forestry project." },
-    { id: "CRC002", type: "Renewable Energy", volume: 2000, status: "Active", date: "2023-02-20", description: "Details for CRC002: Credits from a solar power plant." },
-    { id: "CRC003", type: "Waste Management", volume: 500, status: "Retired", date: "2022-11-01", description: "Details for CRC003: Credits retired for Q4 2022 emissions." },
-    { id: "CRC004", type: "Forestry", volume: 1000, status: "Pending Transfer", date: "2023-04-01", description: "Details for CRC004: Awaiting transfer to another entity." },
-    { id: "CRC005", type: "Industrial Efficiency", volume: 750, status: "Active", date: "2023-05-12", description: "Details for CRC005: Achieved through industrial process optimization." },
-    { id: "CRC006", type: "Forestry", volume: 1200, status: "Active", date: "2023-06-01", description: "Details for CRC006: From a newly certified reforestation project." },
-  ];
+  const PDFViewerModal = ({ fileId, onClose }) => {
+    return (
+      <div className="fixed inset-0 bg-black/90 z-50 flex items-center justify-center p-4">
+        <div className="relative w-full h-full max-w-6xl">
+          <button 
+            onClick={onClose}
+            className="absolute top-4 right-4 z-50 bg-red-500 hover:bg-red-600 text-white rounded-full p-2 shadow-lg"
+          >
+            ✕
+          </button>
+          
+          <div className="h-full w-full bg-gray-900 rounded-lg overflow-hidden">
+            <iframe
+              src={`http://localhost:5000/api/certificates/view/${fileId}?noauth=true#toolbar=0`}
+              className="w-full h-full border-none"
+              title="PDF Viewer"
+            />
+          </div>
+        </div>
+      </div>
+    );
+  };
 
-  // marketCredits remain as is, but can be expanded similarly if needed for the marketplace view
-  const marketCredits = [
-    { id: "CRC007", type: "Renewable Energy", volume: 1000, status: "Available", date: "2025-05-10", description: "Available for purchase." },
-    { id: "CRC008", type: "Forestry", volume: 750, status: "Available", date: "2025-05-01", description: "Available for purchase." },
-  ];
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-screen bg-gray-900">
+        <FaSpinner className="animate-spin text-emerald-400 text-4xl mr-3" />
+        <span className="text-emerald-400 text-xl">Loading your dashboard...</span>
+      </div>
+    );
+  }
 
-  return (
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center h-screen bg-gray-900 p-8">
+        <div className="text-red-400 text-xl mb-4">Error loading dashboard: {error}</div>
+        <button
+          onClick={() => window.location.reload()}
+          className="px-6 py-3 bg-emerald-600 rounded-lg hover:bg-emerald-700 transition-colors"
+        >
+          Retry Loading
+        </button>
+        <button
+          onClick={() => navigate("/")}
+          className="mt-4 px-6 py-3 bg-gray-700 rounded-lg hover:bg-gray-600 transition-colors"
+        >
+          Return Home
+        </button>
+      </div>
+    );
+  }
+
+   return (
     <div className="flex h-screen bg-gray-900 text-white">
       {/* Sidebar */}
       <div className="w-1/5 bg-gradient-to-b from-emerald-900 via-green-900 to-teal-900 text-white flex flex-col justify-between p-6 shadow-2xl">
@@ -46,7 +166,7 @@ export default function Dashboard() {
           <div className="flex items-center mb-8">
             <span className="text-3xl mr-3">🌿</span>
             <h4 className="text-2xl font-bold bg-gradient-to-r from-emerald-400 to-teal-400 bg-clip-text text-transparent">
-              GreenCredit
+              EcoLedger
             </h4>
           </div>
           <ul className="space-y-3">
@@ -92,16 +212,14 @@ export default function Dashboard() {
           </ul>
         </div>
         <div className="text-xs text-emerald-300 text-center p-4 bg-emerald-900/30 rounded-lg">
-          © 2025 GreenCredit
+          © 2025 EcoLedger
         </div>
       </div>
 
-      {/* Main Content */}
       <div className="w-4/5 p-8 overflow-auto bg-gray-900">
-        {/* Top Navbar */}
         <div className="flex space-x-4 mb-8">
           {[
-            { key: "carbon", label: "MY GREEN DASHBOARD", icon: "🌿" },
+            { key: "carbon", label: "ECOBOARD", icon: "🌿" },
             { key: "auth", label: "AUTHENTICATION STATUS", icon: "⚙️" },
             { key: "admin", label: "LEADERBOARD", icon: "📈" }
           ].map((tab) => (
@@ -120,171 +238,268 @@ export default function Dashboard() {
           ))}
         </div>
 
-        {/* Stat Boxes */}
-        <div className="grid grid-cols-3 gap-6 mb-8">
-          <div className="bg-gradient-to-br from-gray-800 to-gray-900 shadow-2xl rounded-2xl p-6 border border-gray-700 hover:border-emerald-500 transition-all duration-300 transform hover:scale-105">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-gray-400 text-sm">Total Credits:</p>
-                <h4 className="text-3xl font-bold text-emerald-400">5,500</h4>
-                <p className="text-gray-500 text-xs">tCO2e</p>
-              </div>
-              <span className="text-4xl opacity-20">🌿</span>
+        {selectedTab === 'carbon' ? (
+          <>
+            <div className="grid grid-cols-3 gap-6 mb-8">
+              {[
+                { title: "Total Credits", value: ownedCredits.reduce((sum, item) => sum + item.volume, 0).toLocaleString(), unit: "tCO2e", icon: "🌿", color: "emerald" },
+                { title: "Market Listings", value: marketCredits.length.toString(), unit: "credits", icon: "📊", color: "blue" },
+                { title: "Market Value", value: `$${marketCredits.reduce((sum, item) => sum + (item.totalValue || 0), 0).toLocaleString()}`, unit: "USD", icon: "💰", color: "yellow" }
+              ].map((stat, index) => (
+                <div 
+                  key={index}
+                  className={`bg-gradient-to-br from-gray-800 to-gray-900 shadow-2xl rounded-2xl p-6 border border-gray-700 hover:border-${stat.color}-500 transition-all duration-300 transform hover:scale-105`}
+                >
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-gray-400 text-sm">{stat.title}</p>
+                      <h4 className={`text-3xl font-bold text-${stat.color}-400`}>{stat.value}</h4>
+                      <p className="text-gray-500 text-xs">{stat.unit}</p>
+                    </div>
+                    <span className="text-4xl opacity-20">{stat.icon}</span>
+                  </div>
+                </div>
+              ))}
             </div>
-          </div>
-          <div className="bg-gradient-to-br from-gray-800 to-gray-900 shadow-2xl rounded-2xl p-6 border border-gray-700 hover:border-blue-500 transition-all duration-300 transform hover:scale-105">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-gray-400 text-sm">Transferred:</p>
-                <h4 className="text-3xl font-bold text-blue-400">1,500</h4>
-                <p className="text-gray-500 text-xs">tCO2e</p>
-              </div>
-              <span className="text-4xl opacity-20">📤</span>
+
+            <div className="flex space-x-4 mb-8">
+              <button
+                className="bg-gradient-to-r from-emerald-500 to-teal-500 text-white px-8 py-3 rounded-xl font-semibold hover:from-emerald-600 hover:to-teal-600 transition-all duration-300 transform hover:scale-105 shadow-lg shadow-emerald-500/25 flex items-center"
+                onClick={() => navigate("/upload")}
+              >
+                <span className="mr-2">🌱</span>
+                UPLOAD NEW CREDIT
+              </button>
+              <button 
+                className="bg-gradient-to-r from-red-500 to-pink-500 text-white px-8 py-3 rounded-xl font-semibold hover:from-red-600 hover:to-pink-600 transition-all duration-300 transform hover:scale-105 shadow-lg shadow-red-500/25 flex items-center"
+                onClick={() => alert("Retirement functionality coming soon!")}
+              >
+                <span className="mr-2">🗑️</span>
+                RETIRE/BURN CREDITS
+              </button>
             </div>
-          </div>
-          <div className="bg-gradient-to-br from-gray-800 to-gray-900 shadow-2xl rounded-2xl p-6 border border-gray-700 hover:border-yellow-500 transition-all duration-300 transform hover:scale-105">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-gray-400 text-sm">Marketplace Value:</p>
-                <h4 className="text-3xl font-bold text-yellow-400">$135,000</h4>
-                <p className="text-gray-500 text-xs">USD</p>
-              </div>
-              <span className="text-4xl opacity-20">💰</span>
+
+            <div className="flex bg-gray-800 rounded-2xl p-2 mb-8 border border-gray-700 inline-flex shadow-lg">
+              <button
+                className={`px-8 py-3 text-sm font-semibold rounded-xl transition-all duration-300 ${
+                  selectedToggle === "owned"
+                    ? "bg-gradient-to-r from-emerald-500 to-teal-500 text-white shadow-lg"
+                    : "text-gray-400 hover:text-white hover:bg-gray-700"
+                }`}
+                onClick={() => setSelectedToggle("owned")}
+              >
+                Owned Credits
+              </button>
+              <button
+                className={`px-8 py-3 text-sm font-semibold rounded-xl transition-all duration-300 ${
+                  selectedToggle === "marketplace"
+                    ? "bg-gradient-to-r from-emerald-500 to-teal-500 text-white shadow-lg"
+                    : "text-gray-400 hover:text-white hover:bg-gray-700"
+                }`}
+                onClick={() => setSelectedToggle("marketplace")}
+              >
+                Credit Marketplace
+              </button>
             </div>
-          </div>
-        </div>
 
-        {/* Action Buttons */}
-        <div className="flex space-x-4 mb-8">
-          <button
-            className="bg-gradient-to-r from-emerald-500 to-teal-500 text-white px-8 py-3 rounded-xl font-semibold hover:from-emerald-600 hover:to-teal-600 transition-all duration-300 transform hover:scale-105 shadow-lg shadow-emerald-500/25 flex items-center"
-            onClick={() => navigate("/upload")} // This button now correctly navigates
-          >
-            <span className="mr-2">🌱</span>
-            UPLOAD NEW CREDIT
-          </button>
-          <button className="bg-gradient-to-r from-red-500 to-pink-500 text-white px-8 py-3 rounded-xl font-semibold hover:from-red-600 hover:to-pink-600 transition-all duration-300 transform hover:scale-105 shadow-lg shadow-red-500/25 flex items-center">
-            <span className="mr-2">🗑️</span>
-            RETIRE/BURN CREDITS
-          </button>
-        </div>
-
-        {/* Toggle */}
-        <div className="flex bg-gray-800 rounded-2xl p-2 mb-8 border border-gray-700 inline-flex shadow-lg">
-          <button
-            className={`px-8 py-3 text-sm font-semibold rounded-xl transition-all duration-300 ${
-              selectedToggle === "owned"
-                ? "bg-gradient-to-r from-emerald-500 to-teal-500 text-white shadow-lg"
-                : "text-gray-400 hover:text-white hover:bg-gray-700"
-            }`}
-            onClick={() => setSelectedToggle("owned")}
-          >
-            Owned Credits
-          </button>
-          <button
-            className={`px-8 py-3 text-sm font-semibold rounded-xl transition-all duration-300 ${
-              selectedToggle === "marketplace"
-                ? "bg-gradient-to-r from-emerald-500 to-teal-500 text-white shadow-lg"
-                : "text-gray-400 hover:text-white hover:bg-gray-700"
-            }`}
-            onClick={() => setSelectedToggle("marketplace")}
-          >
-            Credit Marketplace
-          </button>
-        </div>
-
-        {/* Table */}
-        <div className="bg-gradient-to-br from-gray-800 to-gray-900 p-6 rounded-2xl shadow-2xl border border-gray-700">
-          <h4 className="text-2xl font-bold mb-6 text-emerald-400 flex items-center">
-            <span className="mr-3">🌿</span>
-            Your Carbon Credit Portfolio
-          </h4>
-          <div className="overflow-x-auto">
-            <table className="min-w-full text-sm text-left">
-              <thead className="bg-gray-700/50 text-gray-300 border-b border-gray-600">
-                <tr>
-                  <th className="px-6 py-4 font-bold">ID</th>
-                  <th className="px-6 py-4 font-bold">Type</th>
-                  <th className="px-6 py-4 font-bold">Volume (tCO2e)</th>
-                  <th className="px-6 py-4 font-bold">Status</th>
-                  <th className="px-6 py-4 font-bold">Issue Date</th>
-                  <th className="px-6 py-4 font-bold text-center">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(selectedToggle === "owned" ? ownedCredits : marketCredits).map((item, idx) => (
-                  <tr
-                    key={idx}
-                    className="border-t border-gray-700 hover:bg-gray-700/30 transition-all duration-300"
-                  >
-                    <td className="px-6 py-4 font-mono text-emerald-300">{item.id}</td>
-                    <td className="px-6 py-4 flex items-center">
-                      <span className="mr-3 text-xl">{getTypeIcon(item.type)}</span>
-                      {item.type}
-                    </td>
-                    <td className="px-6 py-4 font-bold text-blue-300">{item.volume.toLocaleString()}</td>
-                    <td className="px-6 py-4">
-                      <span
-                        className={`px-3 py-1 rounded-full text-xs font-bold ${
-                          item.status === "Active"
-                            ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"
-                            : item.status === "Retired"
-                            ? "bg-red-500/20 text-red-400 border border-red-500/30"
-                            : item.status === "Pending Transfer"
-                            ? "bg-blue-500/20 text-blue-400 border border-blue-500/30"
-                            : item.status === "Available"
-                            ? "bg-yellow-500/20 text-yellow-400 border border-yellow-500/30"
-                            : "bg-gray-500/20 text-gray-400 border border-gray-500/30"
-                        }`}
+            <div className="bg-gradient-to-br from-gray-800 to-gray-900 p-6 rounded-2xl shadow-2xl border border-gray-700">
+              <h4 className="text-2xl font-bold mb-6 text-emerald-400 flex items-center">
+                <span className="mr-3">🌿</span>
+                {selectedToggle === "owned" ? "Your Carbon Credit Portfolio" : "Credit Marketplace"}
+              </h4>
+              <div className="overflow-x-auto">
+                <table className="min-w-full text-sm text-left">
+                  <thead className="bg-gray-700/50 text-gray-300 border-b border-gray-600">
+                    <tr>
+                      <th className="px-6 py-4 font-bold">ID</th>
+                      <th className="px-6 py-4 font-bold">Type</th>
+                      <th className="px-6 py-4 font-bold">Volume (tCO2e)</th>
+                      {selectedToggle === "marketplace" && (
+                        <th className="px-6 py-4 font-bold">Price</th>
+                      )}
+                      <th className="px-6 py-4 font-bold">Status</th>
+                      <th className="px-6 py-4 font-bold">Date</th>
+                      <th className="px-6 py-4 font-bold text-center">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(selectedToggle === "owned" ? ownedCredits : marketCredits).map((item, idx) => (
+                      <tr
+                        key={idx}
+                        className="border-t border-gray-700 hover:bg-gray-700/30 transition-all duration-300"
                       >
-                        {item.status}
-                      </span>
-                    </td>
-                    <td className="px-6 py-4 text-gray-400">{item.date}</td>
-                    <td className="px-6 py-4 text-center">
-                      <div className="flex items-center justify-center space-x-3">
-                        <button
-                          className="text-gray-400 hover:text-emerald-400 cursor-pointer text-lg transition-colors duration-300 transform hover:scale-110 bg-gray-700/50 hover:bg-emerald-500/20 rounded-lg p-2"
-                          title="View Details"
-                          onClick={() => setSelectedCreditForDetails(item)}
-                        >
-                          {/* Using direct emoji for icons as in your current code */}
-                          👁️
-                        </button>
-                        {(selectedToggle === "owned" || item.status === "Available") && (
-                          <button
-                            className="text-gray-400 hover:text-blue-400 cursor-pointer text-lg transition-colors duration-300 transform hover:scale-110 bg-gray-700/50 hover:bg-blue-500/20 rounded-lg p-2"
-                            title="Transfer/Trade Credit"
-                            onClick={() => alert(`Initiate transfer/trade for ${item.id}`)}
-                          >
-                            {/* Using direct emoji for icons as in your current code */}
-                            📤
-                          </button>
+                        <td className="px-6 py-4 font-mono text-emerald-300">{item.id}</td>
+                        <td className="px-6 py-4 flex items-center">
+                          <span className="mr-3 text-xl">{getTypeIcon(item.type)}</span>
+                          {item.type}
+                        </td>
+                        <td className="px-6 py-4 font-bold text-blue-300">{item.volume.toLocaleString()}</td>
+                        {selectedToggle === "marketplace" && (
+                          <td className="px-6 py-4 font-bold text-yellow-300">
+                            ${item.totalValue?.toFixed(2) || "N/A"}
+                          </td>
                         )}
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                        <td className="px-6 py-4">
+                          <span
+                            className={`px-3 py-1 rounded-full text-xs font-bold ${
+                              item.status === "Active" || item.status === "Available"
+                                ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"
+                                : item.status === "Retired"
+                                ? "bg-red-500/20 text-red-400 border border-red-500/30"
+                                : "bg-gray-500/20 text-gray-400 border border-gray-500/30"
+                            }`}
+                          >
+                            {item.status}
+                          </span>
+                        </td>
+                        <td className="px-6 py-4 text-gray-400">{item.date}</td>
+                        <td className="px-6 py-4 text-center">
+                          <div className="flex items-center justify-center space-x-3">
+                            <button
+                              className="text-gray-400 hover:text-emerald-400 cursor-pointer text-lg transition-colors duration-300 transform hover:scale-110 bg-gray-700/50 hover:bg-emerald-500/20 rounded-lg p-2"
+                              title="View Details"
+                              onClick={() => setSelectedCreditForDetails(item)}
+                            >
+                              <FaEye />
+                            </button>
+                            <button
+                              className="text-gray-400 hover:text-blue-400 cursor-pointer text-lg transition-colors duration-300 transform hover:scale-110 bg-gray-700/50 hover:bg-blue-500/20 rounded-lg p-2"
+                              title="View Certificate"
+                              onClick={() => {
+                                setCurrentPdfId(item.rawData.fileId);
+                                setPdfViewerOpen(true);
+                              }}
+                            >
+                              <FaFilePdf />
+                            </button>
+                            {selectedToggle === "owned" && (
+                              <button
+                                className="text-gray-400 hover:text-yellow-400 cursor-pointer text-lg transition-colors duration-300 transform hover:scale-110 bg-gray-700/50 hover:bg-yellow-500/20 rounded-lg p-2"
+                                title="List on Marketplace"
+                                onClick={() => navigate("/upload")}
+                              >
+                                <FaShareSquare />
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
 
-          {/* Pagination */}
-          <div className="flex justify-between items-center mt-6 text-sm text-gray-400">
-            <span>Page 1 of 2</span>
-            <div className="flex space-x-2">
-              <button className="px-4 py-2 bg-gray-700 rounded-lg hover:bg-gray-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed" disabled>
-                Previous
-              </button>
-              <button className="px-4 py-2 bg-gray-700 rounded-lg hover:bg-gray-600 transition-colors">
-                Next
-              </button>
+              <div className="flex justify-between items-center mt-6 text-sm text-gray-400">
+                <span>Showing {selectedToggle === "owned" ? ownedCredits.length : marketCredits.length} items</span>
+                <div className="flex space-x-2">
+                  <button className="px-4 py-2 bg-gray-700 rounded-lg hover:bg-gray-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed" disabled>
+                    Previous
+                  </button>
+                  <button className="px-4 py-2 bg-gray-700 rounded-lg hover:bg-gray-600 transition-colors">
+                    Next
+                  </button>
+                </div>
+              </div>
             </div>
+          </>
+        ) : selectedTab === 'auth' ? (
+          <div className="bg-gradient-to-br from-gray-800 to-gray-900 p-6 rounded-2xl shadow-2xl border border-gray-700">
+            <h4 className="text-2xl font-bold mb-6 text-emerald-400 flex items-center">
+              <span className="mr-3">🔒</span>
+              Certificate Authentication Status
+            </h4>
+            
+            {location.state?.authResult ? (
+              <div className="space-y-6">
+                <div className={`p-4 rounded-lg ${
+                  location.state.authResult.authenticated 
+                    ? 'bg-emerald-900/30 border border-emerald-700'
+                    : 'bg-yellow-900/30 border border-yellow-700'
+                }`}>
+                  <div className="flex items-center">
+                    {location.state.authResult.authenticated ? (
+                      <FaCheckCircle className="text-emerald-400 mr-3" size={24} />
+                    ) : (
+                      <FaTimesCircle className="text-yellow-400 mr-3" size={24} />
+                    )}
+                    <div>
+                      <h3 className="font-bold">
+                        {location.state.authResult.authenticated ? 'Verified' : 'Unverified'}
+                      </h3>
+                      <p className="text-sm opacity-80">{location.state.authResult.message}</p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-4">
+                  <h5 className="text-lg font-semibold text-gray-300">Certificate Details</h5>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="bg-gray-700/50 p-3 rounded-lg">
+                      <p className="text-gray-400 text-sm">Project ID</p>
+                      <p className="font-mono text-emerald-300">
+                        {location.state.authResult.extracted_data?.project_id || 'N/A'}
+                      </p>
+                    </div>
+                    <div className="bg-gray-700/50 p-3 rounded-lg">
+                      <p className="text-gray-400 text-sm">Serial Number</p>
+                      <p className="font-mono text-blue-300">
+                        {location.state.authResult.extracted_data?.serial_number || 'N/A'}
+                      </p>
+                    </div>
+                    <div className="bg-gray-700/50 p-3 rounded-lg">
+                      <p className="text-gray-400 text-sm">Amount</p>
+                      <p className="font-bold">
+                        {location.state.authResult.extracted_data?.amount || '0'} tCO₂
+                      </p>
+                    </div>
+                    <div className="bg-gray-700/50 p-3 rounded-lg">
+                      <p className="text-gray-400 text-sm">Issuance Date</p>
+                      <p>
+                        {location.state.authResult.extracted_data?.issuance_date || 'N/A'}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-4">
+                  <h5 className="text-lg font-semibold text-gray-300">Verification Details</h5>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="bg-gray-700/50 p-3 rounded-lg">
+                      <p className="text-gray-400 text-sm">Registry</p>
+                      <p className="text-emerald-300">
+                        {location.state.authResult.carbonmark_details?.name || 'N/A'}
+                      </p>
+                    </div>
+                    <div className="bg-gray-700/50 p-3 rounded-lg">
+                      <p className="text-gray-400 text-sm">Blockchain Status</p>
+                      <p className="text-purple-300">
+                        {location.state.authResult.blockchain_status || 'N/A'}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="text-center py-12">
+                <FaInfoCircle className="mx-auto text-gray-500 text-4xl mb-4" />
+                <p className="text-gray-400">No authentication data available</p>
+                <button
+                  onClick={() => navigate('/upload')}
+                  className="mt-4 px-6 py-2 bg-emerald-600 rounded-lg hover:bg-emerald-700 transition-colors"
+                >
+                  Upload Certificate
+                </button>
+              </div>
+            )}
           </div>
-        </div>
+        ) : (
+          <div className="bg-gradient-to-br from-gray-800 to-gray-900 p-6 rounded-2xl shadow-2xl border border-gray-700">
+            <h4 className="text-2xl font-bold mb-6 text-emerald-400">Leaderboard</h4>
+            <p className="text-gray-400">Coming soon...</p>
+          </div>
+        )}
       </div>
 
-      {/* Enhanced Credit Details Modal */}
       {selectedCreditForDetails && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 backdrop-blur-sm">
           <div className="bg-gradient-to-br from-gray-800 to-gray-900 p-8 rounded-2xl shadow-2xl w-1/2 max-w-lg border border-gray-700">
@@ -302,30 +517,50 @@ export default function Dashboard() {
               </div>
               <div className="flex justify-between items-center p-3 bg-gray-700/50 rounded-lg">
                 <span className="text-gray-400">Volume:</span>
-                <span className="font-semibold text-blue-400">{selectedCreditForDetails.volume.toLocaleString()} tCO2e</span>
+                <span className="font-semibold text-blue-400">
+                  {selectedCreditForDetails.volume.toLocaleString()} tCO2e
+                </span>
               </div>
+              {selectedCreditForDetails.price && (
+                <div className="flex justify-between items-center p-3 bg-gray-700/50 rounded-lg">
+                  <span className="text-gray-400">Price:</span>
+                  <span className="font-semibold text-yellow-400">
+                    ${selectedCreditForDetails.price.toFixed(2)} per credit
+                  </span>
+                </div>
+              )}
               <div className="flex justify-between items-center p-3 bg-gray-700/50 rounded-lg">
                 <span className="text-gray-400">Status:</span>
                 <span
                   className={`px-3 py-1 rounded-full text-xs font-bold ${
-                    selectedCreditForDetails.status === "Active"
+                    selectedCreditForDetails.status === "Active" || selectedCreditForDetails.status === "Available"
                       ? "bg-emerald-500/20 text-emerald-400"
-                      : selectedCreditForDetails.status === "Retired"
-                      ? "bg-red-500/20 text-red-400"
-                      : "bg-blue-500/20 text-blue-400"
+                      : "bg-red-500/20 text-red-400"
                   }`}
                 >
                   {selectedCreditForDetails.status}
                 </span>
               </div>
-              <div className="flex justify-between items-center p-3 bg-gray-700/50 rounded-lg">
-                <span className="text-gray-400">Issue Date:</span>
-                <span className="font-semibold text-white">{selectedCreditForDetails.date}</span>
-              </div>
               <div className="p-3 bg-gray-700/50 rounded-lg">
                 <span className="text-gray-400 block mb-2">Description:</span>
                 <p className="text-gray-300">{selectedCreditForDetails.description}</p>
               </div>
+              {selectedCreditForDetails.rawData?.carbonmark_details && (
+                <div className="p-3 bg-gray-700/50 rounded-lg">
+                  <span className="text-gray-400 block mb-2">Carbonmark Verification:</span>
+                  <p className="text-emerald-300">
+                    {selectedCreditForDetails.rawData.carbonmark_details.name || "Verified"}
+                  </p>
+                </div>
+              )}
+              {selectedCreditForDetails.rawData?.blockchain_status && (
+                <div className="p-3 bg-gray-700/50 rounded-lg">
+                  <span className="text-gray-400 block mb-2">Blockchain Status:</span>
+                  <p className="text-purple-300">
+                    {selectedCreditForDetails.rawData.blockchain_status}
+                  </p>
+                </div>
+              )}
             </div>
 
             <button
@@ -336,6 +571,13 @@ export default function Dashboard() {
             </button>
           </div>
         </div>
+      )}
+
+      {pdfViewerOpen && (
+        <PDFViewerModal 
+          fileId={currentPdfId} 
+          onClose={() => setPdfViewerOpen(false)} 
+        />
       )}
     </div>
   );

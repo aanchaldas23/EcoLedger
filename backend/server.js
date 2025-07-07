@@ -1,335 +1,457 @@
-// server.js
-require('dotenv').config(); // Load environment variables from .env file
+// server.js - Carbon Credits Platform (Node.js/Express)
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const path = require('path');
-const fs = require('fs');
-const crypto = require('crypto');
 const multer = require('multer');
+const crypto = require('crypto');
+const { MongoClient, GridFSBucket, ObjectId } = require('mongodb');
+const { GridFsStorage } = require('multer-gridfs-storage');
+const path = require('path');
 const axios = require('axios');
 const FormData = require('form-data');
-const { MongoClient } = require('mongodb');
+const bcrypt = require('bcryptjs');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// MongoDB connection
-let db;
-MongoClient.connect(process.env.MONGO_URI, { useUnifiedTopology: true })
-  .then(client => {
-    db = client.db('greencredits'); // Connect to the 'greencredits' database
-    console.log('✅ MongoDB connected');
-  })
-  .catch(err => console.error('❌ MongoDB connection error:', err));
+// Configuration
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017';
+const DATABASE_NAME = process.env.DATABASE_NAME || 'EcoLedger';
 
-// Middleware
-app.use(cors()); // Enable CORS for all routes (crucial for frontend communication)
-app.use(express.json()); // Body parser for JSON requests
-app.use(express.urlencoded({ extended: true })); // Body parser for URL-encoded requests
+// Initialize MongoDB connection and GridFS
+let client, db, gfsBucket;
 
-// Ensure the 'uploads' directory exists
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir);
-}
-app.use('/uploads', express.static(uploadDir)); // Serve static files from 'uploads' directory
+(async () => {
+  try {
+    client = new MongoClient(MONGO_URI);
+    await client.connect();
+    
+    db = client.db(DATABASE_NAME);
+    console.log('✅ MongoDB connected successfully');
+    
+    // Initialize GridFS bucket after successful DB connection
+    gfsBucket = new GridFSBucket(db, {
+      bucketName: 'credits',
+      chunkSizeBytes: 1024 * 255
+    });
 
-// Multer config for file uploads
-const storage = multer.diskStorage({
-  destination: 'uploads/', // Files will be stored in the 'uploads' directory
-  filename: (req, file, cb) => {
-    const timestamp = Date.now();
-    const randomString = crypto.randomBytes(4).toString('hex');
-    const ext = path.extname(file.originalname);
-    cb(null, `${timestamp}-${randomString}${ext}`);
+    await db.collection('credits').createIndex({ fileId: 1 });
+    await db.collection('credits').createIndex({ userId: 1 });
+    await db.collection('credits').createIndex({ status: 1 });
+    await db.collection('users').createIndex({ email: 1 }, { unique: true });
+    await db.collection('users').createIndex({ userId: 1 }, { unique: true });
+
+    console.log('✅ MongoDB connected successfully with indexes created');
+  } catch (err) {
+    console.error('❌ MongoDB connection error:', err);
+    process.exit(1);
   }
-});
+})();
 
-// Init upload: Add file type and size validation here
-const upload = multer({
-    storage: storage,
-    limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB limit
-    fileFilter: (req, file, cb) => {
-        // Check file type to ensure it's PDF
-        if (file.mimetype === 'application/pdf') {
-            cb(null, true);
-        } else {
-            cb(new Error('Only PDF files are allowed!'), false);
-        }
-    }
-}).single('certificate'); // 'certificate' must match the formData.append('certificate', file) in frontend
+app.use(cors({ origin: 'http://localhost:5173', credentials: true }));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-
-// ROUTES
-
-// Basic route to check if the backend is running
-app.get('/', (req, res) => {
-  res.send('🌿 GreenCredits backend is running');
-});
-
-// Upload Certificate Route
-app.post('/api/upload-certificate', (req, res) => {
-  upload(req, res, async (err) => {
-    if (err) {
-      console.error('Multer upload error:', err.message);
-      if (err.message === 'Only PDF files are allowed!') {
-        return res.status(400).json({ message: 'Invalid file type. Only PDF files are allowed.' });
-      }
-      if (err.code === 'LIMIT_FILE_SIZE') {
-        return res.status(400).json({ message: 'File too large. Max 5MB allowed.' });
-      }
-      return res.status(500).json({ message: 'An unexpected error occurred during upload.' });
-    }
-
-    const file = req.file;
-    if (!file) {
-      return res.status(400).json({ message: 'No file selected for upload.' });
-    }
-
-    try {
-      const buffer = fs.readFileSync(file.path);
-      const hash = crypto.createHash('sha256').update(buffer).digest('hex');
-
-      const existing = await db.collection('certificates').findOne({ hash });
-      if (existing) {
-        fs.unlink(file.path, (unlinkErr) => {
-          if (unlinkErr) console.error('Error deleting duplicate file:', unlinkErr);
-        });
-        return res.status(409).json({ message: 'Duplicate certificate. This certificate has already been uploaded.', creditId: existing.creditId, hash });
-      }
-
-      const creditId = 'CREDIT-' + Date.now();
-      const doc = {
-        creditId,
-        fileName: file.filename,
+// Custom GridFS upload function
+async function uploadToGridFS(file, metadata) {
+  return new Promise((resolve, reject) => {
+    const filename = crypto.randomBytes(16).toString('hex') + path.extname(file.originalname);
+    const uploadStream = gfsBucket.openUploadStream(filename, {
+      metadata: {
+        ...metadata,
         originalName: file.originalname,
-        filePath: file.path,
-        fileMimeType: file.mimetype,
-        fileSize: file.size,
-        uploadDate: new Date(),
-        hash,
-        status: 'pending', // Initial status (e.g., 'pending', 'uploaded', 'unauthenticated')
-      };
+        uploadDate: new Date()
+      }
+    });
 
-      await db.collection('certificates').insertOne(doc);
-      res.status(201).json({ message: 'Certificate uploaded and details saved for authentication!', creditId, hash });
-    } catch (err) {
-      console.error('Database save or hash error:', err);
-      fs.unlink(file.path, (unlinkErr) => {
-        if (unlinkErr) console.error('Error deleting file after DB error:', unlinkErr);
+    uploadStream.on('error', (error) => {
+      reject(error);
+    });
+
+    uploadStream.on('finish', () => {
+      resolve({
+        id: uploadStream.id,
+        filename: filename,
+        originalname: file.originalname,
+        size: file.size,
+        metadata: uploadStream.options.metadata
       });
-      res.status(500).json({ message: 'Failed to process certificate. Please try again.' });
-    }
+    });
+
+    uploadStream.end(file.buffer);
   });
-});
-
-
-// Authenticate Certificate Route
-app.post('/authenticate', async (req, res) => {
-  try {
-    const { creditId } = req.body;
-    const cert = await db.collection('certificates').findOne({ creditId });
-    if (!cert) {
-      return res.status(404).json({ error: 'Credit ID not found' });
-    }
-
-    const filePath = cert.filePath;
-    if (!fs.existsSync(filePath)) {
-        return res.status(404).json({ error: 'Certificate file not found on server.' });
-    }
-
-    const form = new FormData();
-    form.append('certificate', fs.createReadStream(filePath));
-
-    const flaskRes = await axios.post('http://localhost:5001/authenticate', form, {
-      headers: form.getHeaders()
-    });
-
-    const authData = flaskRes.data;
-
-    // Prepare the update document fields based on Flask response
-    let updateFields = {
-        status: authData.authenticated ? 'authenticated' : (authData.status || 'unauthenticated'), // Use authenticated flag first, then Flask status, default unauthenticated
-        authenticatedAt: new Date(),
-        flaskResponse: authData // Store the full Flask response for audit/debugging
-    };
-
-    if (authData.extracted_data) {
-        updateFields.extractedData = authData.extracted_data; // Store the entire extracted_data object
-    }
-    if (authData.carbonmark_details) {
-        updateFields.carbonmarkDetails = authData.carbonmark_details; // Store the entire carbonmark_details object
-    }
-    if (authData.blockchain_status) {
-        updateFields.blockchainStatus = authData.blockchain_status; // Store blockchain status
-    }
-    if (authData.fabric_tx_id) {
-        updateFields.fabricTxId = authData.fabric_tx_id; // Store Fabric Tx ID
-    }
-
-    // Perform the update
-    const updated = await db.collection('certificates').findOneAndUpdate(
-      { creditId },
-      { $set: updateFields },
-      { returnDocument: 'after' }
-    );
-
-    if (!updated.value) {
-        console.error(`Failed to find and update certificate with creditId: ${creditId}`);
-        return res.status(500).json({ message: 'Failed to update certificate details after authentication.' });
-    }
-
-    res.json({
-      message: 'Certificate authentication process completed!',
-      creditId: updated.value.creditId,
-      authResult: authData // Send the entire Flask response object back to frontend
-    });
-  } catch (err) {
-    console.error('Auth error:', err.message);
-    let errorMessage = 'Authentication request failed.';
-    let statusCode = 500;
-    if (err.response && err.response.data) {
-        errorMessage = err.response.data.message || err.response.data.error || errorMessage;
-        statusCode = err.response.status;
-    }
-
-    if (req.body.creditId) {
-        await db.collection('certificates').findOneAndUpdate(
-            { creditId: req.body.creditId },
-            { $set: { status: 'authentication_failed', authenticatedAt: new Date(), authenticationError: errorMessage } }
-        );
-    }
-    res.status(statusCode).json({ error: errorMessage, details: err.message });
+}
+// Multer setup for memory storage
+const storage = multer.memoryStorage();
+const upload = multer({
+  storage,
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === 'application/pdf') cb(null, true);
+    else cb(new Error('Only PDF files are allowed!'), false);
   }
 });
 
-// --- NEW: List on Marketplace Route ---
-app.post('/api/list-on-marketplace', async (req, res) => {
-    try {
-        const { serial_number, price, priceType, extractedData, carbonmarkDetails } = req.body;
-
-        if (!serial_number) {
-            return res.status(400).json({ message: 'Serial number is required to list a credit.' });
-        }
-
-        // Find the certificate by serial_number (nested in extractedData)
-        let certificate = await db.collection('certificates').findOne({ 'extractedData.serial_number': serial_number });
-
-        let updateDoc = {
-            isListed: true,
-            priceType: priceType,
-            status: 'listed', // Update overall status to 'listed'
-            listedAt: new Date(),
-        };
-
-        if (priceType === 'fixed' && typeof price === 'number') {
-            updateDoc.marketplacePrice = price;
-        } else if (priceType === 'negotiation') {
-            updateDoc.marketplacePrice = null; // Ensure price is null for negotiation
-        }
-
-        if (certificate) {
-            // Update existing certificate
-            await db.collection('certificates').updateOne(
-                { 'extractedData.serial_number': serial_number },
-                { $set: updateDoc }
-            );
-            res.status(200).json({ message: 'Credit successfully listed on marketplace!' });
-        } else {
-            // Fallback: If for some reason the cert isn't found by serial number,
-            // create a new entry with the provided data.
-            const newCreditId = 'CREDIT-' + Date.now();
-            const newDoc = {
-                creditId: newCreditId,
-                extractedData: extractedData,
-                carbonmarkDetails: carbonmarkDetails,
-                uploadDate: new Date(),
-                status: 'listed',
-                isListed: true,
-                priceType: priceType,
-                marketplacePrice: updateDoc.marketplacePrice,
-                listedAt: new Date(),
-            };
-            await db.collection('certificates').insertOne(newDoc);
-            res.status(201).json({ message: 'Credit created and listed on marketplace!', creditId: newCreditId });
-        }
-
-    } catch (error) {
-        console.error('Error listing credit on marketplace:', error);
-        res.status(500).json({ message: 'Failed to list credit on marketplace.', error: error.message });
-    }
-});
-
-// --- NEW: Get all credits for Dashboard ---
-app.get('/api/credits', async (req, res) => {
-    try {
-        const credits = await db.collection('certificates').find({}).toArray();
-        res.status(200).json(credits);
-    } catch (error) {
-        console.error('Error fetching credits:', error);
-        res.status(500).json({ message: 'Failed to fetch credits.', error: error.message });
-    }
-});
-
-
-// Helper: Generate userId
 const generateUserId = () => 'USER-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 8);
+const generateCreditId = () => 'CREDIT-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 8);
 
-// User Registration (now /api/auth/signup)
-app.post('/api/auth/signup', async (req, res) => {
+// Middleware to validate user
+const validateUser = async (req, res, next) => {
   try {
-    const { email, password, role } = req.body;
-
-    if (!email || !password || !role) {
-      return res.status(400).json({ message: 'Email, password, and role are required.' });
+    const email = req.headers['email'];
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        error: 'missing_email',
+        message: 'Email header is required'
+      });
     }
-
-    const existingUser = await db.collection('users').findOne({ email });
-    if (existingUser) {
-      return res.status(409).json({ message: 'User already exists with this email.' });
-    }
-
-    // IMPORTANT: Passwords are NOT hashed in this version. For secure applications, you MUST hash passwords.
-    const userId = generateUserId();
-
-    await db.collection('users').insertOne({
-      userId,
-      email,
-      password: password,
-      role: role,
-      createdAt: new Date(),
-    });
-
-    res.status(201).json({ message: 'User registered successfully!' });
-  } catch (err) {
-    console.error('Sign Up error:', err);
-    res.status(500).json({ message: 'Server error during registration.' });
-  }
-});
-
-// User Login (now /api/auth/signin)
-app.post('/api/auth/signin', async (req, res) => {
-  try {
-    const { email, password } = req.body;
 
     const user = await db.collection('users').findOne({ email });
     if (!user) {
-      return res.status(400).json({ message: 'Invalid credentials.' });
+      return res.status(404).json({
+        success: false,
+        error: 'user_not_found',
+        message: 'User not found'
+      });
     }
 
-    // IMPORTANT: Passwords are NOT hashed in this version.
-    if (user.password !== password) {
-      return res.status(400).json({ message: 'Invalid credentials.' });
-    }
-
-    res.status(200).json({ message: 'Sign in successful!', userId: user.userId });
+    req.user = user; // Attach user to request
+    next();
   } catch (err) {
-    console.error('Sign In error:', err);
-    res.status(500).json({ message: 'Server error during sign in.' });
+    console.error('User validation error:', err);
+    res.status(500).json({
+      success: false,
+      error: 'validation_error',
+      message: 'User validation failed'
+    });
+  }
+};
+
+// Routes
+
+app.post('/api/auth/signup', async (req, res) => {
+  try {
+    const { name, email, password, role = 'user' } = req.body;
+    if (!email || !password || !name) return res.status(400).json({ success: false, error: 'missing_fields', message: 'Name, email, password, and role are required' });
+
+    const existingUser = await db.collection('users').findOne({ email });
+    if (existingUser) return res.status(409).json({ success: false, error: 'user_exists', message: 'User already exists with this email' });
+
+    const userId = generateUserId();
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    await db.collection('users').insertOne({ userId, email, name, password: hashedPassword, role, createdAt: new Date(), updatedAt: new Date(), credits: [] });
+
+    res.status(201).json({ success: true, message: 'User registered successfully', userId });
+  } catch (err) {
+    console.error('Signup error:', err);
+    res.status(500).json({ success: false, error: 'server_error', message: 'Server error during registration' });
   }
 });
 
-// Start Server
+app.post('/api/auth/signin', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = await db.collection('users').findOne({ email });
+    if (!user) return res.status(400).json({ success: false, error: 'invalid_credentials', message: 'Invalid email or password' });
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) return res.status(400).json({ success: false, error: 'invalid_credentials', message: 'Invalid email or password' });
+
+    res.json({ success: true, message: 'Login successful', user: { userId: user.userId, email: user.email, name: user.name, role: user.role } });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ success: false, error: 'server_error', message: 'Server error during login' });
+  }
+});
+
+
+app.post('/api/credits/upload', validateUser, upload.single('certificate'), async (req, res) => {
+  console.log(req.body);
+  try {
+    const email = req.headers['email'];
+    console.log('Upload request received for email:', email);
+    const user = await db.collection('users').findOne({ email });
+    console.log('User found:', user);
+    
+    if (!user || !req.file) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'upload_failed', 
+        message: 'Invalid user or no file uploaded' 
+      });
+    }
+
+    // Upload file to GridFS
+    const uploadedFile = await uploadToGridFS(req.file, {
+      email,
+      userId: user.userId
+    });
+
+    const creditId = generateCreditId();
+    await db.collection('credits').insertOne({ 
+      creditId, 
+      fileId: uploadedFile.id, 
+      filename: uploadedFile.filename, 
+      userId: user.userId, 
+      originalName: uploadedFile.originalname, 
+      fileSize: uploadedFile.size, 
+      uploadDate: new Date(), 
+      status: 'pending', 
+      metadata: uploadedFile.metadata 
+    });
+    
+    await db.collection('users').updateOne(
+      { userId: user.userId }, 
+      { $push: { credits: creditId } }
+    );
+
+    res.status(201).json({ 
+      success: true, 
+      message: 'Credit certificate uploaded successfully', 
+      creditId, 
+      fileId: uploadedFile.id.toString() 
+    });
+  } catch (err) {
+    console.error('Upload error:', err);
+    res.status(500).json({ 
+      success: false, 
+      error: 'upload_failed', 
+      message: 'Failed to upload credit certificate' 
+    });
+  }
+});
+
+app.post('/api/credits/authenticate', async (req, res) => {
+  try {
+    const email = req.headers['email'];
+    const { creditId } = req.body;
+    const user = await db.collection('users').findOne({ email });
+    const credit = await db.collection('credits').findOne({ creditId, userId: user.userId });
+
+    if (!credit) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'not_found', 
+        message: 'Credit not found or not owned by user' 
+      });
+    }
+
+    const tempFilePath = path.join(__dirname, 'temp', credit.filename);
+    await fs.promises.mkdir(path.dirname(tempFilePath), { recursive: true });
+
+    const downloadStream = gfsBucket.openDownloadStream(credit.fileId);
+    const writeStream = fs.createWriteStream(tempFilePath);
+    downloadStream.pipe(writeStream);
+    
+    await new Promise((resolve, reject) => {
+      writeStream.on('finish', resolve);
+      writeStream.on('error', reject);
+      downloadStream.on('error', reject);
+    });
+
+    const form = new FormData();
+    form.append('certificate', fs.createReadStream(tempFilePath));
+    const flaskRes = await axios.post('http://localhost:5001/api/authenticate', form, { 
+      headers: form.getHeaders() 
+    });
+
+    const authData = flaskRes.data;
+    const updateFields = {
+      status: authData.authenticated ? 'authenticated' : 'unauthenticated',
+      authenticatedAt: new Date(),
+      authResult: authData
+    };
+    
+    if (authData.extracted_data) updateFields.extractedData = authData.extracted_data;
+    if (authData.carbonmark_details) updateFields.carbonmarkDetails = authData.carbonmark_details;
+
+    const updateResult = await db.collection('credits').updateOne(
+      { creditId, userId: user.userId },
+      { $set: updateFields }
+    );
+
+    console.log('🔍 Update Result:', updateResult);
+    if (updateResult.modifiedCount === 0) {
+      return res.status(500).json({ 
+        success: false, 
+        error: 'update_failed', 
+        message: 'Failed to update credit authentication status' 
+      });
+    }
+
+    await fs.promises.unlink(tempFilePath);
+
+    res.json({ 
+      success: true, 
+      message: 'Credit authentication completed', 
+      creditId, 
+      authenticated: authData.authenticated, 
+      details: authData 
+    });
+  } catch (err) {
+    console.error('Authentication error:', err);
+    res.status(500).json({ 
+      success: false, 
+      error: 'authentication_failed', 
+      message: 'Failed to authenticate credit' 
+    });
+  }
+});
+
+app.get('/api/credits/:fileId/view', async (req, res) => {
+  try {
+    const fileId = new ObjectId(req.params.fileId);
+    const email = req.headers['email'];
+    const user = await db.collection('users').findOne({ email });
+
+    const files = await db.collection('credits.files').find({ _id: fileId }).toArray();
+    if (!files || files.length === 0) {
+      return res.status(404).json({ success: false, error: 'not_found', message: 'File not found' });
+    }
+
+    const file = files[0];
+    const credit = await db.collection('credits').findOne({ fileId });
+    if (!credit || (credit.userId !== user.userId && user.role !== 'admin')) {
+      return res.status(403).json({ success: false, error: 'forbidden', message: 'Not authorized to access this file' });
+    }
+
+    res.set({
+      'Content-Type': file.contentType || 'application/pdf',
+      'Content-Disposition': `inline; filename="${file.filename}"`
+    });
+
+    const downloadStream = gfsBucket.openDownloadStream(fileId);
+    downloadStream.on('error', () => {
+      res.status(500).json({ success: false, error: 'stream_error', message: 'Error streaming file' });
+    });
+    downloadStream.pipe(res);
+  } catch (err) {
+    console.error('View error:', err);
+    res.status(500).json({ success: false, error: 'server_error', message: 'Failed to view file' });
+  }
+});
+
+// List credit on marketplace
+app.post('/api/marketplace/list', async (req, res) => {
+  try {
+    const { creditId, pricePerCredit, currency = 'USD' } = req.body;
+    const email = req.headers['email'];
+    const user = await db.collection('users').findOne({ email });
+
+    if (!creditId || !pricePerCredit) {
+      return res.status(400).json({ success: false, error: 'missing_fields', message: 'creditId and pricePerCredit are required' });
+    }
+
+    const credit = await db.collection('credits').findOne({ creditId, userId: user.userId, status: 'authenticated' });
+    if (!credit) {
+      return res.status(404).json({ success: false, error: 'invalid_credit', message: 'Credit not found, not authenticated, or not owned by user' });
+    }
+
+    const listing = {
+      listingId: `LIST-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`,
+      creditId,
+      sellerId: user.userId,
+      pricePerCredit: parseFloat(pricePerCredit),
+      currency,
+      amount: credit.extractedData?.amount || 1,
+      status: 'listed',
+      listedAt: new Date(),
+      updatedAt: new Date(),
+      creditDetails: {
+        serialNumber: credit.extractedData?.serial_number,
+        projectId: credit.extractedData?.project_id,
+        vintage: credit.extractedData?.vintage,
+        registry: credit.extractedData?.registry
+      }
+    };
+
+    await db.collection('marketplace').insertOne(listing);
+    await db.collection('credits').updateOne({ creditId }, { $set: { status: 'listed' } });
+
+    res.status(201).json({ success: true, message: 'Credit listed on marketplace successfully', listingId: listing.listingId });
+  } catch (err) {
+    console.error('Marketplace listing error:', err);
+    res.status(500).json({ success: false, error: 'listing_failed', message: 'Failed to list credit on marketplace' });
+  }
+});
+
+// Get marketplace listings
+app.get('/api/marketplace/listings', async (req, res) => {
+  try {
+    const { status = 'listed', limit = 20, offset = 0 } = req.query;
+    const query = { status };
+
+    const listings = await db.collection('marketplace')
+      .find(query)
+      .sort({ listedAt: -1 })
+      .skip(parseInt(offset))
+      .limit(parseInt(limit))
+      .toArray();
+
+    const sanitizedListings = listings.map(listing => {
+      const sanitized = { ...listing };
+      if (sanitized._id) sanitized._id = sanitized._id.toString();
+      return sanitized;
+    });
+
+    const total = await db.collection('marketplace').countDocuments(query);
+
+    res.json({ success: true, listings: sanitizedListings, total, limit: parseInt(limit), offset: parseInt(offset) });
+  } catch (err) {
+    console.error('Listings fetch error:', err);
+    res.status(500).json({ success: false, error: 'fetch_failed', message: 'Failed to fetch marketplace listings' });
+  }
+});
+
+// Get user credits
+app.get('/api/users/me/credits', async (req, res) => {
+  try {
+    const email = req.headers['email'];
+    const user = await db.collection('users').findOne({ email });
+    const credits = await db.collection('credits')
+      .find({ userId: user.userId })
+      .sort({ uploadDate: -1 })
+      .toArray();
+
+    const sanitizedCredits = credits.map(credit => {
+      const sanitized = { ...credit };
+      if (sanitized._id) sanitized._id = sanitized._id.toString();
+      if (sanitized.fileId) sanitized.fileId = sanitized.fileId.toString();
+      if (sanitized.uploadDate) sanitized.uploadDate = sanitized.uploadDate.toISOString();
+      if (sanitized.authenticatedAt) sanitized.authenticatedAt = sanitized.authenticatedAt.toISOString();
+      return sanitized;
+    });
+
+    res.json({ success: true, credits: sanitizedCredits });
+  } catch (err) {
+    console.error('User credits fetch error:', err);
+    res.status(500).json({ success: false, error: 'fetch_failed', message: 'Failed to fetch user credits' });
+  }
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Server error:', err);
+  res.status(500).json({
+    success: false,
+    error: 'server_error',
+    message: 'Internal server error'
+  });
+});
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('Shutting down gracefully...');
+  if (client) {
+    await client.close();
+  }
+  process.exit(0);
+});
+
+// Start server
 app.listen(PORT, () => {
-  console.log(`🚀 Backend running on port ${PORT}`);
+  console.log(`🚀 Server running on http://localhost:${PORT}`);
 });

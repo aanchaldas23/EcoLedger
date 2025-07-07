@@ -19,7 +19,7 @@ export default function AuthenticationPage() {
             setAuthResult(location.state.authResult);
             setUploadedFileName(location.state.uploadedFileName || 'N/A');
             
-            // Auto-redirect for unauthenticated certificates after 3 seconds
+            // Auto-redirect for unauthenticated certificates after 10 seconds
             if (location.state.authResult.authenticated === false) {
                 setTimeout(() => {
                     navigate('/dashboard', { 
@@ -28,7 +28,7 @@ export default function AuthenticationPage() {
                             messageType: 'error'
                         }
                     });
-                }, 3000);
+                }, 10000);
             }
         } else {
             setMessage('No authentication data provided. Please upload a certificate first.');
