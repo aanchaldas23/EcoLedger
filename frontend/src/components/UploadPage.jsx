@@ -42,6 +42,7 @@ export default function UploadPage() {
         formData.append('certificate', selectedFile);
 
         let uploadedFileName = selectedFile.name;
+        let uploadedserialNumber = null;
 
         try {
             // Step 1: Upload the certificate to Node.js backend
@@ -81,7 +82,7 @@ export default function UploadPage() {
                 headers: {
                     email: email, // ✅ user's email from login
                 },
-                body: authFormData,
+                body: JSON.stringify({ serialNumber: uploadedserialNumber }),
             });
             console.log('Authentication response:', authResponse);
             const authData = await authResponse.json();

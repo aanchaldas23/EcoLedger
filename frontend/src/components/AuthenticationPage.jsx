@@ -37,71 +37,53 @@ export default function AuthenticationPage() {
     }, [location.state, navigate]);
 
     const handleListOnMarketplace = async () => {
-        if (!listingPrice || parseFloat(listingPrice) <= 0) {
-            alert('Please enter a valid price per credit');
-            return;
-        }
-
         setIsListing(true);
-        
         try {
+            if (!authResult || !authResult.credit_id || !authResult.extracted_data) {
+                throw new Error('Authentication data missing for listing.');
+            }
+
+            // 1. Get email from localStorage
+            const email = localStorage.getItem('email');
+            if (!email) {
+                alert('User not logged in. Please log in to list credits.');
+                setIsListing(false);
+                return;
+            }
+
+            // 2. Prepare listingData with correct keys
             const listingData = {
-                // Certificate data from authentication
-                project_id: authResult.extracted_data.project_id,
-                project_name: authResult.extracted_data.project_name,
-                vintage: authResult.extracted_data.vintage,
-                serial_number: authResult.extracted_data.serial_number,
-                amount: authResult.extracted_data.amount,
-                issuance_date: authResult.extracted_data.issuance_date,
-                registry: authResult.extracted_data.registry,
-                category: authResult.extracted_data.category,
-                issued_to: authResult.extracted_data.issued_to,
-                
-                // Carbonmark verification data
-                carbonmark_id: authResult.carbonmark_details?.id,
-                carbonmark_name: authResult.carbonmark_details?.name,
-                
-                // Blockchain data
-                blockchain_status: authResult.blockchain_status,
-                fabric_tx_id: authResult.fabric_tx_id,
-                
-                // Marketplace listing data
-                price_per_credit: parseFloat(listingPrice),
-                total_value: parseFloat(listingPrice) * parseFloat(authResult.extracted_data.amount),
-                listing_description: listingDescription || `Verified carbon credits from ${authResult.extracted_data.project_name}`,
-                listed_date: new Date().toISOString(),
-                status: 'available',
-                
-                // Metadata
-                verified: true,
-                authentication_date: new Date().toISOString(),
-                original_filename: uploadedFileName
+                creditId: authResult.credit_id, // Make sure credit_id is available here from authResult
+                pricePerCredit: parseFloat(listingPrice), // Changed from price_per_credit
+                description: listingDescription || `Verified carbon credits from ${authResult.extracted_data.project_name}`, // Changed from listing_description
             };
 
             // Call your backend API to list the credit on marketplace
-            const response = await fetch('http://localhost:5001/api/marketplace/list', {
+            const response = await fetch('http://localhost:5000/api/marketplace/list', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
+                    'email': email, // 3. ADD THIS EMAIL HEADER
                 },
                 body: JSON.stringify(listingData)
             });
 
             if (response.ok) {
                 const result = await response.json();
-                navigate('/dashboard', { 
-                    state: { 
+                navigate('/dashboard', {
+                    state: {
                         message: `Credit ${authResult.extracted_data.project_id} successfully listed on marketplace!`,
                         messageType: 'success',
                         newListing: result
                     }
                 });
             } else {
-                throw new Error('Failed to list credit on marketplace');
+                const errorData = await response.json();
+                throw new Error(errorData.message || 'Failed to list credit on marketplace');
             }
         } catch (error) {
             console.error('Error listing credit:', error);
-            alert('Failed to list credit on marketplace. Please try again.');
+            alert(`Failed to list credit on marketplace: ${error.message}. Please try again.`);
         } finally {
             setIsListing(false);
         }

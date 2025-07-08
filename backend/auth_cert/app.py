@@ -69,6 +69,9 @@ def extract_text_from_pdf(pdf_path):
 def parse_certificate_data(text):
     """Parse extracted text to find certificate details."""
     extracted_data = {}
+    if not text: # Handle case where text is None or empty string
+        return extracted_data # Return empty dict immediately
+
     for key, pattern in PATTERNS.items():
         match = re.search(pattern, text)
         if match:
@@ -220,6 +223,9 @@ def authenticate_certificate():
 
     temp_path = None
     try:
+        # Initialize extracted_data here to ensure it's always bound
+        extracted_data = {} 
+
         # Secure temporary file handling
         with tempfile.NamedTemporaryFile(delete=False) as temp_file:
             certificate_file.save(temp_file.name)
@@ -228,21 +234,6 @@ def authenticate_certificate():
         # Calculate file hash for deduplication
         file_hash = calculate_file_hash(temp_path)
         
-        # Check if we've processed this file before
-        existing = db.credits.find_one({'file_hash': file_hash})
-        if existing:
-            logger.info(f"Found existing credit with hash {file_hash}")
-            return jsonify({
-                'success': True,
-                'status': 'duplicate',
-                'message': 'This certificate has already been processed',
-                'authenticated': existing.get('status') == 'authenticated',
-                'extracted_data': existing.get('extracted_data'),
-                'carbonmark_details': existing.get('carbonmark_details'),
-                'credit_id': existing.get('creditId'),
-                'file_hash': file_hash
-            }), 200
-
         pdf_text = extract_text_from_pdf(temp_path)
         if not pdf_text:
             return jsonify({
@@ -254,11 +245,15 @@ def authenticate_certificate():
                 'carbonmark_details': None
             }), 400
 
-        extracted_data = parse_certificate_data(pdf_text)
+        # Now, extracted_data is guaranteed to be a dict (at least empty)
+        # This call will overwrite the empty dict if successful
+        extracted_data = parse_certificate_data(pdf_text) 
         logger.info(f"Extracted data: {extracted_data}")
 
         # Validate required fields - maintaining your original fields
         required_fields = ['serial_number', 'project_id', 'amount', 'registry']
+        # The .get(f) will now safely return None if the key is missing,
+        # preventing a KeyError if parse_certificate_data returned an incomplete dict.
         missing_fields = [f for f in required_fields if not extracted_data.get(f)]
         
         if missing_fields:
@@ -267,10 +262,28 @@ def authenticate_certificate():
                 'status': 'missing_fields',
                 'message': f'Missing required fields: {", ".join(missing_fields)}',
                 'missing_fields': missing_fields,
-                'extracted_data': extracted_data,
+                'extracted_data': extracted_data, # This will be the (potentially incomplete) dict
                 'carbonmark_details': None,
                 'authenticated': False
             }), 400
+
+        # Use serial_number as the primary identifier for duplicate checking
+        # This line (231) will now be safe because extracted_data is bound
+        # and missing_fields check ensures 'serial_number' is present and not None.
+        serial_number = extracted_data['serial_number']
+        existing = db.credits.find_one({'extracted_data.serial_number': serial_number})
+        if existing:
+            logger.info(f"Found existing credit with serial number {serial_number}")
+            return jsonify({
+                'success': True,
+                'status': 'duplicate',
+                'message': 'This certificate has already been processed',
+                'authenticated': existing.get('status') == 'authenticated',
+                'extracted_data': existing.get('extracted_data'),
+                'carbonmark_details': existing.get('carbonmark_details'),
+                'serial_number': existing.get('serialNumber'), # Return serialNumber
+                'file_hash': file_hash
+            }), 200
 
         # Carbonmark verification - your original logic
         carbonmark_result = {'verified': False, 'message': 'Skipped verification', 'details': None}
@@ -281,11 +294,9 @@ def authenticate_certificate():
         # Determine authentication status - your original logic
         authenticated = not missing_fields and carbonmark_result.get('verified', False)
         
-        # Create a credit record in MongoDB
-        credit_id = f"CREDIT-{datetime.now().strftime('%Y%m%d')}-{hashlib.sha1(file_hash.encode()).hexdigest()[:8].upper()}"
-        
+        # Create a credit record in MongoDB using serialNumber
         credit_doc = {
-            'creditId': credit_id,
+            'serialNumber': serial_number, # Use serialNumber as the primary ID
             'file_hash': file_hash,
             'authenticated': authenticated,
             'status': 'authenticated' if authenticated else 'unauthenticated',
@@ -295,7 +306,8 @@ def authenticate_certificate():
             'original_filename': secure_filename(certificate_file.filename)
         }
         
-        #db.credits.insert_one(credit_doc)
+        # Insert the new credit document
+        db.credits.insert_one(credit_doc)
 
         # Complete response with all your original fields
         response = {
@@ -308,7 +320,7 @@ def authenticate_certificate():
             'blockchain_status': 'Verified on private Fabric chain',
             'fabric_tx_id': f"tx_{os.urandom(8).hex()}",
             'original_filename': secure_filename(certificate_file.filename),
-            'credit_id': credit_id,
+            'serial_number': serial_number, # Return serialNumber
             'file_hash': file_hash
         }
 
@@ -331,71 +343,6 @@ def authenticate_certificate():
             except Exception as e:
                 logger.warning(f"Error deleting temp file: {e}")
 
-@app.route('/api/marketplace/list', methods=['GET'])
-def get_marketplace_listings():
-    """Get marketplace listings with optional filtering."""
-    if db is None:
-        return jsonify({'error': 'Database not available'}), 500
-
-    try:
-        user_id = request.args.get('user')
-        status = request.args.get('status', 'available')
-        limit = int(request.args.get('limit', 20))
-        offset = int(request.args.get('offset', 0))
-
-        query = {'status': status} if status != 'all' else {}
-        if user_id:
-            query['$or'] = [
-                {'owner_id': user_id},
-                {'status': 'available'}
-            ]
-
-        listings = list(db.marketplace_listings.find(query)
-                       .sort('listed_date', -1)
-                       .skip(offset)
-                       .limit(limit))
-
-        for listing in listings:
-            listing['_id'] = str(listing['_id'])
-            if 'total_value' not in listing and 'price_per_credit' in listing and 'amount' in listing:
-                listing['total_value'] = float(listing['price_per_credit'])* float(listing['amount'])
-            if 'listed_date' in listing:
-                listing['listed_date'] = listing['listed_date'].isoformat()
-            if 'created_at' in listing:
-                listing['created_at'] = listing['created_at'].isoformat()
-
-        return jsonify({
-            'success': True,
-            'listings': listings,
-            'total': len(listings),
-            'offset': offset,
-            'limit': limit
-        }), 200
-
-    except Exception as e:
-        logger.error(f"Get listings error: {e}")
-        return jsonify({'error': f'Failed to fetch listings: {str(e)}'}), 500
-
-@app.route('/api/marketplace/listings/<listing_id>', methods=['GET'])
-def get_listing(listing_id):
-    """Get a specific marketplace listing."""
-    if db is None:
-        return jsonify({'error': 'Database not available'}), 500
-
-    try:
-        listing = db.marketplace_listings.find_one({'_id': ObjectId(listing_id)})
-        if not listing:
-            return jsonify({'error': 'Listing not found'}), 404
-
-        listing['_id'] = str(listing['_id'])
-        if 'listed_date' in listing:
-            listing['listed_date'] = listing['listed_date'].isoformat()
-
-        return jsonify({'success': True, 'listing': listing}), 200
-
-    except Exception as e:
-        logger.error(f"Get listing error: {e}")
-        return jsonify({'error': f'Failed to fetch listing: {str(e)}'}), 500
 
 if __name__ == "__main__":
     if not CARBONMARK_API_KEY:
