@@ -35,70 +35,69 @@ export default function UploadPage() {
         }
 
         setUploading(true);
-        setMessage('Uploading...');
+        setMessage('Uploading and authenticating...');
         setUploadStatus(null);
 
         const formData = new FormData();
         formData.append('certificate', selectedFile);
 
-        let uploadedFileName = selectedFile.name;
-        let uploadedserialNumber = null;
-
         try {
-            // Step 1: Upload the certificate to Node.js backend
-            const uploadResponse = await fetch('http://localhost:5000/api/credits/upload', {
+            // Single API call that handles both upload AND authentication
+            const response = await fetch('http://localhost:5000/api/credits/upload', {
                 method: 'POST',
                 headers: {
-                    email: email, // ✅ user's email from login
+                    email: email,
                 },
                 body: formData,
             });
 
-            const uploadData = await uploadResponse.json();
+            // Add debugging to see what we're getting back
+            console.log('Response status:', response.status);
+            console.log('Response headers:', response.headers);
+            
+            const responseText = await response.text();
+            console.log('Raw response:', responseText);
 
-            if (!uploadResponse.ok) {
-                if (uploadResponse.status === 409) {
-                    setMessage(uploadData.message || 'Duplicate certificate detected.');
+            // Try to parse the response
+            let data;
+            try {
+                data = JSON.parse(responseText);
+            } catch (parseError) {
+                console.error('JSON parse error:', parseError);
+                console.error('Response text:', responseText);
+                throw new Error('Invalid response format from server');
+            }
+
+            if (!response.ok) {
+                if (response.status === 409) {
+                    setMessage(data.message || 'Duplicate certificate detected.');
                     setUploadStatus('duplicate');
                 } else {
-                    setMessage(uploadData.message || 'File upload failed.');
+                    setMessage(data.message || 'File upload failed.');
                     setUploadStatus('error');
                 }
                 setUploading(false);
                 return;
             }
 
-            setMessage('Upload successful! Authenticating...');
+            setMessage('Upload and authentication successful!');
             setUploadStatus('success');
             setUploading(false);
-            setAuthProcessing(true);
 
-            // Step 2: Authenticate using Flask API (send file again)
-            const authFormData = new FormData();
-            authFormData.append('certificate', selectedFile);
-
-            const authResponse = await fetch('http://localhost:5001/api/credits/authenticate', {
-                method: 'POST',
-                headers: {
-                    email: email, // ✅ user's email from login
-                },
-                body: JSON.stringify({ serialNumber: uploadedserialNumber }),
-            });
-            console.log('Authentication response:', authResponse);
-            const authData = await authResponse.json();
-
+            // Navigate to results page with the authentication result
             navigate('/authenticate-result', {
                 state: {
-                    authResult: authData.authResult || authData,
-                    uploadedFileName: uploadedFileName,
+                    authResult: data.authenticationResult || data,
+                    uploadedFileName: selectedFile.name,
+                    serialNumber: data.serialNumber
                 },
             });
+
         } catch (error) {
             console.error('Error during upload or authentication:', error);
             setMessage(`Failed to process certificate: ${error.message}`);
             setUploadStatus('error');
             setUploading(false);
-            setAuthProcessing(false);
         }
     };
 

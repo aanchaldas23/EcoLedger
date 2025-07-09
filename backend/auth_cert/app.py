@@ -1,4 +1,4 @@
-# app.py - Carbon Credits Authentication Service (Python/Flask)
+# app.py - Carbon Credits Authentication Service
 from flask import Flask, request, jsonify
 from PyPDF2 import PdfReader
 import re
@@ -8,7 +8,6 @@ import os
 from flask_cors import CORS
 from pymongo import MongoClient
 from datetime import datetime
-from bson import ObjectId
 import logging
 from werkzeug.utils import secure_filename
 import tempfile
@@ -30,7 +29,6 @@ CARBONMARK_API_KEY = os.getenv("CARBONMARK_API_KEY")
 CARBONMARK_API_BASE_URL = os.getenv("CARBONMARK_API_BASE_URL", "https://api.carbonmark.com")
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "EcoLedger")
-MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 
 # MongoDB setup
 try:
@@ -55,12 +53,13 @@ PATTERNS = {
     'issued_to': r"[Ii]ssued [Tt]o:\s*(.+)",
 }
 
-# Helper Functions
 def extract_text_from_pdf(pdf_path):
-    """Extract text from PDF file."""
+    """Extract text from PDF file with error handling."""
     try:
+        logger.info(f"Extracting text from PDF: {pdf_path}")
         reader = PdfReader(pdf_path)
         text = ''.join(page.extract_text() or "" for page in reader.pages)
+        logger.info(f"Successfully extracted {len(text)} characters from PDF")
         return text
     except Exception as e:
         logger.error(f"Error extracting text from PDF: {e}")
@@ -69,8 +68,9 @@ def extract_text_from_pdf(pdf_path):
 def parse_certificate_data(text):
     """Parse extracted text to find certificate details."""
     extracted_data = {}
-    if not text: # Handle case where text is None or empty string
-        return extracted_data # Return empty dict immediately
+    if not text:
+        logger.warning("No text provided to parse_certificate_data")
+        return extracted_data
 
     for key, pattern in PATTERNS.items():
         match = re.search(pattern, text)
@@ -81,14 +81,17 @@ def parse_certificate_data(text):
                 try:
                     value = float(value)
                 except ValueError:
-                    pass
+                    logger.warning(f"Could not convert amount '{value}' to float")
             extracted_data[key] = value
         else:
+            logger.debug(f"No match found for pattern: {key}")
             extracted_data[key] = None
+    
+    logger.info(f"Extracted data: {extracted_data}")
     return extracted_data
 
 def verify_with_carbonmark(project_id):
-    """Verify project with Carbonmark API with robust response handling."""
+    """Verify project with Carbonmark API with robust error handling."""
     if not CARBONMARK_API_KEY:
         logger.error("CARBONMARK_API_KEY not set")
         return {'verified': False, 'message': 'Carbonmark API key missing', 'details': None}
@@ -100,15 +103,16 @@ def verify_with_carbonmark(project_id):
     try:
         # Step 1: Try search endpoint
         search_url = f"{CARBONMARK_API_BASE_URL}/carbonProjects"
+        logger.debug(f"Searching Carbonmark API: {search_url}")
         search_resp = requests.get(search_url, headers=headers, params={'search': normalized_id}, timeout=10)
         search_resp.raise_for_status()
         
-        # Handle both dict and list responses
         search_data = search_resp.json()
         projects = search_data['items'] if isinstance(search_data, dict) else search_data
         
         for p in projects:
             if p.get('key', '').upper() == normalized_id or p.get('projectID', '').upper() == normalized_id:
+                logger.info(f"Project found via search: {normalized_id}")
                 return {
                     'verified': True,
                     'message': 'Found via search',
@@ -122,9 +126,11 @@ def verify_with_carbonmark(project_id):
 
         # Step 2: Try direct lookup
         direct_url = f"{CARBONMARK_API_BASE_URL}/carbonProjects/{normalized_id}"
+        logger.debug(f"Attempting direct lookup: {direct_url}")
         direct_resp = requests.get(direct_url, headers=headers, timeout=10)
         if direct_resp.status_code == 200:
             p = direct_resp.json()
+            logger.info(f"Project found via direct lookup: {normalized_id}")
             return {
                 'verified': True,
                 'message': 'Found via direct lookup',
@@ -138,6 +144,7 @@ def verify_with_carbonmark(project_id):
 
         # Step 3: Check products/bundles
         products_url = f"{CARBONMARK_API_BASE_URL}/products"
+        logger.debug(f"Checking products: {products_url}")
         products_resp = requests.get(products_url, headers=headers, timeout=10)
         products_resp.raise_for_status()
         
@@ -146,6 +153,7 @@ def verify_with_carbonmark(project_id):
         
         for product in products:
             if normalized_id in [str(pid).upper() for pid in product.get("projectIds", [])]:
+                logger.info(f"Project found in bundle: {product.get('name')}")
                 return {
                     'verified': True,
                     'message': f"Found in bundle: {product.get('name')}",
@@ -157,6 +165,7 @@ def verify_with_carbonmark(project_id):
                     }
                 }
 
+        logger.warning(f"Project not found in Carbonmark: {normalized_id}")
         return {
             'verified': False,
             'message': 'Project not found in Carbonmark',
@@ -179,7 +188,6 @@ def calculate_file_hash(file_path):
             sha256.update(chunk)
     return sha256.hexdigest()
 
-# Routes
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint."""
@@ -199,8 +207,9 @@ def health_check():
 
 @app.route('/api/credits/authenticate', methods=['POST'])
 def authenticate_certificate():
-    """Complete authentication endpoint with all your original logic"""
+    """Complete authentication endpoint"""
     if 'certificate' not in request.files:
+        logger.warning("No certificate file uploaded")
         return jsonify({
             'success': False,
             'status': 'no_file',
@@ -212,6 +221,7 @@ def authenticate_certificate():
 
     certificate_file = request.files['certificate']
     if certificate_file.filename == '':
+        logger.warning("Empty certificate filename")
         return jsonify({
             'success': False,
             'status': 'empty_file',
@@ -223,19 +233,20 @@ def authenticate_certificate():
 
     temp_path = None
     try:
-        # Initialize extracted_data here to ensure it's always bound
-        extracted_data = {} 
-
-        # Secure temporary file handling
+        # Create temp file
         with tempfile.NamedTemporaryFile(delete=False) as temp_file:
             certificate_file.save(temp_file.name)
             temp_path = temp_file.name
+            logger.debug(f"Saved temporary file: {temp_path}")
 
-        # Calculate file hash for deduplication
+        # Calculate file hash
         file_hash = calculate_file_hash(temp_path)
+        logger.debug(f"File hash calculated: {file_hash}")
         
+        # Extract text from PDF
         pdf_text = extract_text_from_pdf(temp_path)
         if not pdf_text:
+            logger.error("Could not extract text from PDF")
             return jsonify({
                 'success': False,
                 'status': 'extraction_failed',
@@ -245,35 +256,30 @@ def authenticate_certificate():
                 'carbonmark_details': None
             }), 400
 
-        # Now, extracted_data is guaranteed to be a dict (at least empty)
-        # This call will overwrite the empty dict if successful
-        extracted_data = parse_certificate_data(pdf_text) 
-        logger.info(f"Extracted data: {extracted_data}")
-
-        # Validate required fields - maintaining your original fields
+        # Parse certificate data
+        extracted_data = parse_certificate_data(pdf_text)
+        
+        # Validate required fields
         required_fields = ['serial_number', 'project_id', 'amount', 'registry']
-        # The .get(f) will now safely return None if the key is missing,
-        # preventing a KeyError if parse_certificate_data returned an incomplete dict.
         missing_fields = [f for f in required_fields if not extracted_data.get(f)]
         
         if missing_fields:
+            logger.warning(f"Missing required fields: {missing_fields}")
             return jsonify({
                 'success': False,
                 'status': 'missing_fields',
                 'message': f'Missing required fields: {", ".join(missing_fields)}',
                 'missing_fields': missing_fields,
-                'extracted_data': extracted_data, # This will be the (potentially incomplete) dict
+                'extracted_data': extracted_data,
                 'carbonmark_details': None,
                 'authenticated': False
             }), 400
 
-        # Use serial_number as the primary identifier for duplicate checking
-        # This line (231) will now be safe because extracted_data is bound
-        # and missing_fields check ensures 'serial_number' is present and not None.
+        # Check for duplicate
         serial_number = extracted_data['serial_number']
         existing = db.credits.find_one({'extracted_data.serial_number': serial_number})
         if existing:
-            logger.info(f"Found existing credit with serial number {serial_number}")
+            logger.info(f"Duplicate found for serial number: {serial_number}")
             return jsonify({
                 'success': True,
                 'status': 'duplicate',
@@ -281,22 +287,23 @@ def authenticate_certificate():
                 'authenticated': existing.get('status') == 'authenticated',
                 'extracted_data': existing.get('extracted_data'),
                 'carbonmark_details': existing.get('carbonmark_details'),
-                'serial_number': existing.get('serialNumber'), # Return serialNumber
+                'serial_number': serial_number,
                 'file_hash': file_hash
             }), 200
 
-        # Carbonmark verification - your original logic
+        # Carbonmark verification
         carbonmark_result = {'verified': False, 'message': 'Skipped verification', 'details': None}
         if extracted_data.get('project_id'):
+            logger.debug(f"Verifying with Carbonmark: {extracted_data['project_id']}")
             carbonmark_result = verify_with_carbonmark(extracted_data['project_id'])
             logger.info(f"Carbonmark result: {carbonmark_result}")
 
-        # Determine authentication status - your original logic
+        # Determine authentication status
         authenticated = not missing_fields and carbonmark_result.get('verified', False)
         
-        # Create a credit record in MongoDB using serialNumber
+        # Create credit record
         credit_doc = {
-            'serialNumber': serial_number, # Use serialNumber as the primary ID
+            'serialNumber': serial_number,
             'file_hash': file_hash,
             'authenticated': authenticated,
             'status': 'authenticated' if authenticated else 'unauthenticated',
@@ -306,10 +313,11 @@ def authenticate_certificate():
             'original_filename': secure_filename(certificate_file.filename)
         }
         
-        # Insert the new credit document
+        # Insert into MongoDB
         db.credits.insert_one(credit_doc)
+        logger.info(f"Inserted new credit document for serial number: {serial_number}")
 
-        # Complete response with all your original fields
+        # Prepare response
         response = {
             'success': True,
             'status': 'authenticated' if authenticated else 'unauthenticated',
@@ -320,7 +328,7 @@ def authenticate_certificate():
             'blockchain_status': 'Verified on private Fabric chain',
             'fabric_tx_id': f"tx_{os.urandom(8).hex()}",
             'original_filename': secure_filename(certificate_file.filename),
-            'serial_number': serial_number, # Return serialNumber
+            'serial_number': serial_number,
             'file_hash': file_hash
         }
 
@@ -340,9 +348,9 @@ def authenticate_certificate():
         if temp_path:
             try:
                 os.unlink(temp_path)
+                logger.debug(f"Deleted temporary file: {temp_path}")
             except Exception as e:
                 logger.warning(f"Error deleting temp file: {e}")
-
 
 if __name__ == "__main__":
     if not CARBONMARK_API_KEY:
