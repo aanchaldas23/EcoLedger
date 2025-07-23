@@ -9,6 +9,11 @@ const fs = require('fs');
 const axios = require('axios');
 const FormData = require('form-data');
 
+//const enrollAdmin = require('./wallet/enrollAdmin.js');
+//const enrollUser = require('./wallet/enrollUser.js');
+//const { submitTransaction } = require('../fabric/doc_functions');
+
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -34,6 +39,9 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// Admin emails from .env
+const ADMIN_EMAILS = process.env.ADMIN_EMAILS ? process.env.ADMIN_EMAILS.split(',') : [];
+
 // User Validation Middleware
 const validateUser = async (req, res, next) => {
   const email = req.headers['email'];
@@ -41,8 +49,17 @@ const validateUser = async (req, res, next) => {
   
   const user = await db.collection('users').findOne({ email });
   if (!user) return res.status(404).json({ success: false, error: 'user_not_found' });
+
+  // Add this debug log
+  console.log('Comparing:', email, 'with admin list:', ADMIN_EMAILS);
   
+  // Case-sensitive comparison (change to .toLowerCase() if needed)
+  req.isAdmin = ADMIN_EMAILS.includes(email);
   req.user = user;
+  
+  // Debug log
+  console.log('Is admin?', req.isAdmin);
+  
   next();
 };
 
@@ -131,78 +148,141 @@ const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
 app.post('/api/credits/upload', validateUser, upload.single('certificate'), async (req, res) => {
+  let uploadStream;
+  let mongoSuccess = false;
+  let blockchainSuccess = false;
+  let serial_number;
+
   try {
+    // 1. Validate file
     if (!req.file) {
       return res.status(400).json({ 
         success: false, 
         error: 'no_file',
-        message: 'No file uploaded'
+        message: 'No file uploaded' 
       });
     }
 
-    // 1. Forward to Flask for authentication (Flask handles the DB insertion)
+    // 2. Authenticate with Flask
     const form = new FormData();
     form.append('certificate', req.file.buffer, {
       filename: req.file.originalname,
       contentType: req.file.mimetype
     });
 
-    const headers = {
-      ...form.getHeaders(),
-      'Content-Length': form.getLengthSync()
-    };
+    const flaskRes = await axios.post(
+      'http://localhost:5001/api/credits/authenticate', 
+      form, 
+      { headers: form.getHeaders() }
+    );
 
-    const flaskRes = await axios.post('http://localhost:5001/api/credits/authenticate', form, { headers });
+    serial_number = flaskRes.data.extracted_data.serial_number;
+    if (!serial_number) throw new Error('No serial number extracted');
 
-    const { serial_number } = flaskRes.data.extracted_data;
-    if (!serial_number) {
-      throw new Error('No serial number extracted');
-    }
-
-    // 2. Store file in GridFS
-    const uploadStream = gfsBucket.openUploadStream(`${serial_number}.pdf`, {
+    // 3. Store in GridFS (UNCONDITIONAL)
+    uploadStream = gfsBucket.openUploadStream(`${serial_number}.pdf`, {
       metadata: { 
         userId: req.user._id,
         email: req.user.email
       }
     });
     uploadStream.end(req.file.buffer);
+    mongoSuccess = true;
 
-    // 3. Update Flask's credit record with GridFS file ID (instead of creating new record)
+    // 4. Prepare blockchain data
+    const blockchainCert = {
+      serialNumber: serial_number,
+      projectId: flaskRes.data.extracted_data.project_id,
+      projectName: flaskRes.data.extracted_data.project_name,
+      vintage: flaskRes.data.extracted_data.vintage,
+      amount: flaskRes.data.extracted_data.amount,
+      registry: flaskRes.data.carbonmark_details?.name || 'Unknown',
+      category: flaskRes.data.extracted_data.category,
+      owner: req.user.email,
+      fileHash: crypto.createHash('sha256').update(req.file.buffer).digest('hex')
+    };
+
+    // 5. Attempt blockchain storage (but don't fail overall if this fails)
+    try {
+      await submitTransaction('CreateCertificate',
+        blockchainCert.serialNumber,
+        blockchainCert.projectId,
+        blockchainCert.projectName,
+        blockchainCert.vintage,
+        blockchainCert.amount.toString(),
+        blockchainCert.registry,
+        blockchainCert.category,
+        blockchainCert.owner,
+        blockchainCert.fileHash
+      );
+      blockchainSuccess = true;
+    } catch (blockchainErr) {
+      console.error('Blockchain storage failed (non-critical):', blockchainErr);
+    }
+
+    // 6. Update MongoDB
     await db.collection('credits').updateOne(
       { serialNumber: serial_number },
       { 
         $set: {
           fileId: uploadStream.id,
           userId: req.user._id,
-          userEmail: req.user.email
+          userEmail: req.user.email,
+          ...(blockchainSuccess && { 
+            blockchainId: serial_number,
+            blockchainStatus: 'minted' 
+          })
         }
-      }
+      },
+      { upsert: true }
     );
 
-    // 4. Update user's credits list
+    // 7. Update user's credits list
     await db.collection('users').updateOne(
       { _id: req.user._id },
-      { $addToSet: { credits: serial_number } } // Use $addToSet to avoid duplicates
+      { $addToSet: { credits: serial_number } }
     );
 
-    res.status(201).json({ 
-      success: true, 
+    // 8. Return response indicating what succeeded
+    res.status(201).json({
+      success: true,
       serialNumber: serial_number,
-      message: 'File uploaded successfully',
-      authenticationResult: flaskRes.data
+      message: 'Certificate processed',
+      storageStatus: {
+        mongo: 'success',
+        blockchain: blockchainSuccess ? 'success' : 'failed',
+        ...(!blockchainSuccess && { 
+          blockchainError: 'Certificate stored in MongoDB but not on blockchain' 
+        })
+      },
+      data: {
+        mongoId: uploadStream.id,
+        ...(blockchainSuccess && { blockchainTx: serial_number }),
+        authentication: flaskRes.data
+      }
     });
+
   } catch (err) {
-    console.error('Upload error:', err);
-    res.status(500).json({ 
-      success: false, 
-      error: 'upload_failed',
-      message: err.message || 'File upload failed'
+    console.error('Upload processing error:', err);
+    
+    // Only clean up GridFS if upload failed before completion
+    if (uploadStream?.id && !mongoSuccess) {
+      await gfsBucket.delete(uploadStream.id).catch(console.error);
+    }
+
+    res.status(500).json({
+      success: false,
+      error: 'processing_error',
+      message: err.message,
+      storageStatus: {
+        mongo: mongoSuccess ? 'success' : 'failed',
+        blockchain: blockchainSuccess ? 'success' : 'not_attempted'
+      }
     });
   }
 });
 
-// Marketplace listing endpoint - Add this to your server.js
+// Marketplace listing endpoint
 app.post('/api/marketplace/list', validateUser, async (req, res) => {
   try {
     const { creditId, pricePerCredit, description } = req.body;
@@ -485,6 +565,171 @@ app.get('/api/users/me/credits', validateUser, async (req, res) => {
       error: 'fetch_failed',
       message: 'Failed to fetch credits'
     });
+  }
+});
+
+// ====================== BLOCKCHAIN ROUTES ======================
+
+// Mint credit on blockchain
+app.post('/api/blockchain/mint', validateUser, async (req, res) => {
+  try {
+    const { creditId } = req.body;
+    
+    // Validate credit exists and belongs to user
+    const credit = await db.collection('credits').findOne({ 
+      _id: new ObjectId(creditId),
+      userId: req.user._id 
+    });
+
+    if (!credit) {
+      return res.status(404).json({ success: false, error: 'credit_not_found' });
+    }
+
+    if (credit.blockchainId) {
+      return res.status(400).json({ success: false, error: 'already_minted' });
+    }
+
+    // In a real app, you would call your blockchain service here
+    // For demo purposes, we'll simulate a response
+    const blockchainResponse = {
+      transactionHash: `0x${crypto.randomBytes(32).toString('hex')}`,
+      tokenId: Math.floor(Math.random() * 1000000),
+      blockNumber: Math.floor(Math.random() * 10000)
+    };
+
+    // Update credit with blockchain info
+    await db.collection('credits').updateOne(
+      { _id: new ObjectId(creditId) },
+      { 
+        $set: { 
+          blockchainId: blockchainResponse.tokenId,
+          transactionHash: blockchainResponse.transactionHash,
+          blockNumber: blockchainResponse.blockNumber,
+          mintedAt: new Date(),
+          status: 'minted',
+          blockchainStatus: 'minted'
+        }
+      }
+    );
+
+    res.json({ 
+      success: true,
+      message: 'Credit minted on blockchain',
+      blockchainResponse
+    });
+  } catch (err) {
+    console.error('Blockchain mint error:', err);
+    res.status(500).json({ success: false, error: 'mint_failed' });
+  }
+});
+
+// Get blockchain transaction status
+app.get('/api/blockchain/transaction/:txHash', async (req, res) => {
+  try {
+    const { txHash } = req.params;
+    
+    // In a real app, you would query your blockchain node here
+    // For demo, return mock data
+    res.json({
+      success: true,
+      status: 'confirmed',
+      blockNumber: Math.floor(Math.random() * 10000),
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error('Transaction status error:', err);
+    res.status(500).json({ success: false, error: 'status_check_failed' });
+  }
+});
+
+// Admin enrollment endpoint
+app.post('/api/enroll/admin', async (req, res) => {
+    try {
+        await enrollAdmin();
+        res.json({ success: true, message: 'Admin enrolled successfully' });
+    } catch (err) {
+        console.error('Admin enrollment error:', err);
+        res.status(500).json({ 
+            success: false, 
+            error: 'admin_enrollment_failed',
+            details: err.message 
+        });
+    }
+});
+
+// User enrollment endpoint
+app.post('/api/enroll/user', validateUser, async (req, res) => {
+    try {
+        await enrollUser(req.user.email);
+        res.json({ success: true, message: 'User enrolled successfully' });
+    } catch (err) {
+        console.error('User enrollment error:', err);
+        res.status(500).json({ 
+            success: false, 
+            error: 'user_enrollment_failed',
+            details: err.message 
+        });
+    }
+});
+
+// ====================== ADMIN ROUTES ======================
+
+// Check if user is admin
+app.get('/api/admin/check', validateUser, async (req, res) => {
+  console.log('Checking admin access for:', req.user.email);
+  console.log('Admin emails:', ADMIN_EMAILS);
+  res.json({ 
+    success: true,
+    isAdmin: req.isAdmin,
+    email: req.user.email,
+    adminEmails: ADMIN_EMAILS
+  });
+});
+
+// Admin dashboard stats
+app.get('/api/admin/stats', validateUser, async (req, res) => {
+  if (!req.isAdmin) {
+    return res.status(403).json({ success: false, error: 'admin_required' });
+  }
+
+  try {
+    const [usersCount, creditsCount, activeListings] = await Promise.all([
+      db.collection('users').countDocuments(),
+      db.collection('credits').countDocuments(),
+      db.collection('marketplace_listings').countDocuments({ status: 'active' })
+    ]);
+
+    res.json({ 
+      success: true,
+      stats: { usersCount, creditsCount, activeListings }
+    });
+  } catch (err) {
+    console.error('Admin stats error:', err);
+    res.status(500).json({ success: false, error: 'stats_failed' });
+  }
+});
+
+// Get all users (admin only)
+app.get('/api/admin/users', validateUser, async (req, res) => {
+  if (!req.isAdmin) {
+    return res.status(403).json({ success: false, error: 'admin_required' });
+  }
+
+  try {
+    const users = await db.collection('users').find().toArray();
+    res.json({ 
+      success: true,
+      users: users.map(user => ({
+        id: user._id,
+        email: user.email,
+        name: user.name,
+        creditsCount: user.credits?.length || 0,
+        createdAt: user.createdAt
+      }))
+    });
+  } catch (err) {
+    console.error('Admin users error:', err);
+    res.status(500).json({ success: false, error: 'users_fetch_failed' });
   }
 });
 

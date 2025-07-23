@@ -121,6 +121,35 @@ const getTypeIcon = (type) => {
   }
 };
 
+const handleAdminPanelClick = async () => {
+  console.log("Admin panel button clicked!");
+  try {
+    const email = localStorage.getItem('email');
+    console.log('Frontend sending email:', email);
+    
+    const response = await fetch('http://localhost:5000/api/admin/check', {
+      headers: {
+        'email': email, // Send in header instead of URL
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    const data = await response.json();
+    console.log('Full admin check response:', data);
+    
+    if (data.isAdmin) {
+      navigate('/admin');
+    } else {
+      alert(`Admin access denied. 
+        Your email: ${data.email}
+        Approved admins: ${data.adminEmails}`);
+    }
+  } catch (err) {
+    console.error('Admin check failed:', err);
+    alert('Error verifying admin status. Check console.');
+  }
+};
+
 
 const PDFViewerModal = ({ fileId, onClose }) => {
   return (
@@ -191,7 +220,9 @@ return (
             <span className="mr-3 text-emerald-300">👤</span>
             Profile
           </li>
-          <li className="cursor-pointer hover:bg-emerald-800/50 p-3 rounded-lg transition-all duration-300 flex items-center">
+          <li 
+            className="cursor-pointer hover:bg-emerald-800/50 p-3 rounded-lg transition-all duration-300 flex items-center"
+            onClick={handleAdminPanelClick}>
             <span className="mr-3 text-emerald-300">⚙️</span>
             Admin Panel
           </li>
